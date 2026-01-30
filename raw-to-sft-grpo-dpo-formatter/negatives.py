@@ -172,6 +172,50 @@ def generate_grpo_responses(
     out.append((_replace_last_number(a, worse), -1.0))
     return _dedup(out)
 
+TAG_PREFIX = "###"
+TAG_LINE_RE = re.compile(rf"(?:\n|\r\n)\s*{re.escape(TAG_PREFIX)}\s*(-?\d+(?:[.,]\d+)?)\s*$")
+
+def _strip_trailing_tag(text: str) -> str:
+    return TAG_LINE_RE.sub("", (text or "").strip()).strip()
+
+def extract_final_answer_number(text: str) -> str | None:
+    t = (text or "").strip()
+
+    # 1) If already tagged, trust the explicit tag
+    m = TAG_LINE_RE.search(t)
+    if m:
+        return m.group(1).replace(",", ".").strip()
+
+    # 2) Else: numeric-only?
+    if is_numeric_answer(t):
+        return t.replace(",", ".").strip()
+
+    # 3) Else: extract from body
+    body = _strip_trailing_tag(t)
+    return _extract_last_number(body)
+
+def ensure_final_tag(text: str) -> str:
+    t = (text or "").strip()
+    if not t:
+        return t
+
+    # compute final from untagged body to avoid self-confirming wrong tags
+    body = _strip_trailing_tag(t)
+    final_num = extract_final_answer_number(body)
+    if not final_num:
+        return t
+
+    # if already tagged with correct one, done
+    if re.search(rf"\n\s*{re.escape(TAG_PREFIX)}\s*{re.escape(final_num)}\s*$", t):
+        return t
+
+    # if has some tag, replace it
+    if TAG_LINE_RE.search(t):
+        t = TAG_LINE_RE.sub(f"\n\n{TAG_PREFIX} {final_num}", t)
+        return t
+
+    return f"{t}\n\n{TAG_PREFIX} {final_num}"
+
 def _dedup(items: List[Tuple[str, float]]) -> List[Tuple[str, float]]:
     seen = set()
     out: List[Tuple[str, float]] = []
