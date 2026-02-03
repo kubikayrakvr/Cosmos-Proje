@@ -32,7 +32,7 @@ except ImportError:
 
 # Model and dataset paths
 WORKSPACE = Path(os.getenv('TRAINING_WORKSPACE', str(Path.home())))
-MODEL_NAME = os.getenv('MODEL_NAME', str(WORKSPACE / 'turkish-gpt2-medium'))
+MODEL_NAME = os.getenv('MODEL_NAME', str(WORKSPACE / ''))
 DATASET_DIR = WORKSPACE / 'data' / 'prepared' / 'tokenized_math_data'
 TRAIN_DATASET_DIR = DATASET_DIR / 'train'
 TEST_DATASET_DIR = DATASET_DIR / 'test'

@@ -74,8 +74,8 @@ def unwrap_compiled_checkpoint(input_path, output_path):
 
 if __name__ == "__main__":
     # Unwrap the model
-    input_checkpoint = r"c:\Users\pc\Downloads\checkpoint-1000"
-    output_checkpoint = r"C:\Users\pc\OneDrive - Yildiz Technical University\Desktop\Cosmos\checkpoint_unwrapped"
+    input_checkpoint = r"c:\Users\pc\Downloads\checkpoint-2000"
+    output_checkpoint = r"C:\Users\pc\OneDrive - Yildiz Technical University\Desktop\Cosmos\checkpoint2_unwrapped"
     
     model, tokenizer = unwrap_compiled_checkpoint(input_checkpoint, output_checkpoint)
     
