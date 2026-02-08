@@ -122,7 +122,7 @@ class GRPODataCollator:
     def __init__(self, tokenizer, max_length=1024):
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.response_template = "### Answer:\n"
+        self.response_template = "### Cevap:\n"
         self.response_token_ids = self.tokenizer.encode(
             self.response_template, 
             add_special_tokens=False
@@ -133,7 +133,7 @@ class GRPODataCollator:
         completions = [x['completion'] for x in batch]
         advantages = [x['advantage'] for x in batch]
 
-        full_texts = [f"### Question:\n{p}\n\n{self.response_template}{c}" for p, c in zip(prompts, completions)]
+        full_texts = [f"### Soru:\n{p}\n\n{self.response_template}{c}" for p, c in zip(prompts, completions)]
         
         tokenized = self.tokenizer(
             full_texts,
