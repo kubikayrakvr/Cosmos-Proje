@@ -26,7 +26,7 @@ export DATASET_NAME="grpo_offline.jsonl"
 # Hiperparametreler
 export MAX_SEQ_LENGTH="1024"
 export NUM_EPOCHS="1"           
-export LEARNING_RATE="1e-5"     
+export LEARNING_RATE="5e-6"     
 export BATCH_SIZE="4"
 export GRAD_ACCUM_STEPS="4"
 export WEIGHT_DECAY="0.01"

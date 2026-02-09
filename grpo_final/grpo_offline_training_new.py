@@ -38,7 +38,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 # Hiperparametreler
 MAX_SEQ_LENGTH = int(os.getenv('MAX_SEQ_LENGTH', '1024'))
 NUM_EPOCHS = float(os.getenv('NUM_EPOCHS', '1'))
-LEARNING_RATE = float(os.getenv('LEARNING_RATE', '1e-5'))
+LEARNING_RATE = float(os.getenv('LEARNING_RATE', '5e-6'))
 BATCH_SIZE = int(os.getenv('BATCH_SIZE', '4'))
 GRAD_ACCUM_STEPS = int(os.getenv('GRAD_ACCUM_STEPS', '4'))
 USE_BF16 = os.getenv('USE_BF16', 'true').lower() == 'true'
@@ -116,59 +116,81 @@ class OfflineGRPODataset(Dataset):
         return self.data[idx]
 
 # ============================================================================
-# 3. COLLATOR 
+# 3. COLLATOR: OFFSET-BASED (TEMİZ VERSİYON)
 # ============================================================================
 class GRPODataCollator:
     def __init__(self, tokenizer, max_length=1024):
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.response_template = "### Cevap:\n"
-        self.response_token_ids = self.tokenizer.encode(
-            self.response_template, 
-            add_special_tokens=False
-        )
+        self.response_template = "### Cevap:\n" 
 
     def __call__(self, batch):
         prompts = [x['prompt'] for x in batch]
         completions = [x['completion'] for x in batch]
         advantages = [x['advantage'] for x in batch]
 
-        full_texts = [f"### Soru:\n{p}\n\n{self.response_template}{c}" for p, c in zip(prompts, completions)]
-        
-        tokenized = self.tokenizer(
-            full_texts,
-            padding=True,          
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt",
-            add_special_tokens=True 
-        )
-        
-        input_ids = tokenized["input_ids"]
-        attention_mask = tokenized["attention_mask"]
-        labels = input_ids.clone() 
+        batch_input_ids = []
+        batch_attention_mask = []
+        batch_labels = []
 
-        # --- MASKELEME ---
-        for i in range(len(input_ids)):
-            response_start_idx = -1
-            len_template = len(self.response_token_ids)
-            
-            for j in range(len(input_ids[i]) - len_template):
-                if input_ids[i][j : j + len_template].tolist() == self.response_token_ids:
-                    response_start_idx = j + len_template 
-                    break
-            
-            if response_start_idx != -1:
-                labels[i, :response_start_idx] = -100 
-            else:
-                labels[i, :] = -100 
+        for p, c in zip(prompts, completions):
 
-            labels[i][attention_mask[i] == 0] = -100
+            # Prompt + Template + Cevap + EOS
+            full_text = f"{p}{self.response_template}{c}{self.tokenizer.eos_token}"
+
+            enc = self.tokenizer(
+                full_text,
+                truncation=True,
+                max_length=self.max_length,
+                padding=False,
+                return_offsets_mapping=True
+            )
+
+            input_ids = enc["input_ids"]
+            attention_mask = enc["attention_mask"]
+            offsets = enc["offset_mapping"]
+
+            # baştan tamamen maskeli
+            labels = [-100] * len(input_ids)
+
+            template_start_index = full_text.index(self.response_template)
+            answer_char_start = template_start_index + len(self.response_template)
+
+            # boşlukları atla
+            while answer_char_start < len(full_text) and full_text[answer_char_start] == " ":
+                answer_char_start += 1
+
+            for i, (start, end) in enumerate(offsets):
+
+                # 🔒 EOS HER ZAMAN MASKELİ
+                if input_ids[i] == self.tokenizer.eos_token_id:
+                    labels[i] = -100
+                    continue
+
+                # sadece cevap tokenları eğitilir
+                if start >= answer_char_start:
+                    labels[i] = input_ids[i]
+
+            batch_input_ids.append(torch.tensor(input_ids))
+            batch_attention_mask.append(torch.tensor(attention_mask))
+            batch_labels.append(torch.tensor(labels))
 
         return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels,
+            "input_ids": torch.nn.utils.rnn.pad_sequence(
+                batch_input_ids,
+                batch_first=True,
+                padding_value=self.tokenizer.pad_token_id
+            ),
+            "attention_mask": torch.nn.utils.rnn.pad_sequence(
+                batch_attention_mask,
+                batch_first=True,
+                padding_value=0
+            ),
+            "labels": torch.nn.utils.rnn.pad_sequence(
+                batch_labels,
+                batch_first=True,
+                padding_value=-100
+            ),
             "advantage": torch.tensor(advantages, dtype=torch.float32)
         }
 
@@ -179,33 +201,31 @@ class OfflineGRPOTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         labels = inputs.get("labels")
         advantages = inputs.get("advantage")
-        
+
         outputs = model(
             input_ids=inputs["input_ids"],
             attention_mask=inputs["attention_mask"]
         )
         logits = outputs.get("logits")
-        
-        # --- LOSS HESABI ---
+
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
-        
-        loss_fct = CrossEntropyLoss(reduction='none') 
-        token_loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-        token_loss = token_loss.view(shift_labels.size())
-        
+
+        loss_fct = CrossEntropyLoss(reduction="none")
+        token_loss = loss_fct(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1)
+        ).view(shift_labels.size())
+
         valid_mask = (shift_labels != -100).float()
         sentence_loss = (token_loss * valid_mask).sum(dim=1) / (valid_mask.sum(dim=1) + 1e-8)
-        
+
         advantages = advantages.to(sentence_loss.device)
 
-        # Safety Clamping 
-        clamped_advantages = torch.clamp(advantages, min=-2.0, max=2.0)
+        clamped_advantages = torch.clamp(advantages, min=-1.0, max=1.0)
 
-        # GRPO: Loss = Hata * Avantaj
-        weighted_loss = sentence_loss * clamped_advantages
-        final_loss = weighted_loss.mean()
-        
+        final_loss = (sentence_loss * (-clamped_advantages)).mean()
+
         return (final_loss, outputs) if return_outputs else final_loss
 
 # ============================================================================
