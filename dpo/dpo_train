@@ -1,0 +1,177 @@
+import torch
+import os
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from trl import DPOTrainer, DPOConfig
+from peft import LoraConfig, get_peft_model
+
+# ==========================================
+# 1. AYARLAR VE YOLLAR
+# ==========================================
+# Kaggle'daki model ve veri seti yolları
+MODEL_PATH = "/kaggle/working/merged_model"   
+DATASET_PATH = "/kaggle/working/dpo_dataset_final.jsonl"
+NEW_MODEL_NAME = "dpo_final_model"
+
+# GPU tipine göre veri tipi seçimi (T4 -> float16)
+dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+
+print(f"📥 Model yükleniyor: {MODEL_PATH}")
+
+# ==========================================
+# 2. MODEL VE TOKENIZER
+# ==========================================
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_PATH,
+    torch_dtype=dtype,
+    device_map="auto"
+)
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+
+# DPO için padding ayarları KRİTİKTİR
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = "left"  # Decoder modellerde DPO için SOL padding şarttır
+
+print("✅ Model ve Tokenizer hazır.")
+
+# ==========================================
+# 3. VERİ SETİ YÜKLEME VE FORMATLAMA (GÜNCELLENDİ)
+# ==========================================
+print(f"📂 Veri seti yükleniyor: {DATASET_PATH}")
+
+# JSONL formatında olduğu için "json" yükleyicisi kullanıyoruz
+dataset = load_dataset("json", data_files=DATASET_PATH, split="train")
+
+# --- YENİ EKLENEN KISIM BAŞLANGIÇ ---
+def format_prompt(example):
+    # Prompt'un başına '### Soru: ' ve sonuna '\n### Cevap:' ekle
+    # strip() ile olası fazladan boşlukları temizleyip formatı oturtuyoruz
+    example["prompt"] = f"### Soru: {example['prompt'].strip()}\n### Cevap:"
+    return example
+
+# Veri setini formatla
+print("🛠️ Promptlar formatlanıyor (### Soru/Cevap ekleniyor)...")
+dataset = dataset.map(format_prompt)
+# --- YENİ EKLENEN KISIM BİTİŞ ---
+
+# Veriyi %90 Eğitim, %10 Test olarak ayırıyoruz
+dataset_split = dataset.train_test_split(test_size=0.05, seed=42)
+train_dataset = dataset_split["train"]
+eval_dataset = dataset_split["test"]
+
+print(f"📊 Eğitim Verisi: {len(train_dataset)} satır")
+print(f"📊 Test Verisi:   {len(eval_dataset)} satır")
+print(f"🔍 Örnek Prompt: {train_dataset[0]['prompt']}") # Kontrol için yazdır
+
+# ==========================================
+# 4. LORA (PEFT) AYARLARI
+# ==========================================
+# Modeli komple eğitmek yerine, sadece adaptörleri eğiteceğiz (Hafıza tasarrufu)
+peft_config = LoraConfig(
+    r=16,                # Adaptör boyutu
+    lora_alpha=32,       # Ölçeklendirme
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM",
+    target_modules=["c_attn", "c_proj", "c_fc"] # GPT-2 katmanları
+)
+
+# ==========================================
+# 5. EĞİTİM AYARLARI (DPO CONFIG)
+# ==========================================
+training_args = DPOConfig(
+    output_dir="./dpo_results",
+    
+    # --- DPO Parametreleri ---
+    beta=0.1,                   # DPO'nun 'cezalandırma' katsayısı (Genelde 0.1)
+    loss_type="sigmoid",        # Standart DPO kaybı
+    
+    # --- Eğitim Hızı ve Süresi ---
+    learning_rate=5e-6,         # DPO çok hassastır, düşük LR kullanıyoruz
+    num_train_epochs=1,         # 1 Epoch genellikle yeterlidir
+    per_device_train_batch_size=2, # GPU hafızasına göre (T4 için 2)
+    gradient_accumulation_steps=8, # Sanal batch size (2*8 = 16 gibi davranır)
+    
+    # --- Raporlama ---
+    eval_strategy="steps",      # Adım bazlı test
+    eval_steps=50,              # Her 50 adımda bir test et
+    save_steps=100,             # Her 100 adımda bir kaydet
+    logging_steps=10,           # Her 10 adımda bir log bas
+    
+    # --- Optimizasyon ---
+    warmup_ratio=0.1,           # Eğitimin %10'u kadar ısınma
+    lr_scheduler_type="cosine", # Yavaşlayan öğrenme hızı
+    fp16=True,                  # Hız ve hafıza için
+    optim="paged_adamw_32bit",  # RAM dostu optimizer
+    
+    # --- Uzunluk Ayarları ---
+    max_prompt_length=512,      # Sorunun uzunluğu
+    max_length=1024,            # Toplam uzunluk (Soru + Cevap)
+    remove_unused_columns=False 
+)
+
+# ==========================================
+# 6. EĞİTİMİ BAŞLATMA
+# ==========================================
+print("\n🚀 DPO Eğitimi Başlıyor...")
+print("ℹ️  Takip Etmen Gerekenler:")
+print("   - rewards/chosen (Artmalı): Modelin iyi cevaba verdiği puan")
+print("   - rewards/rejected (Azalmalı): Modelin kötü cevaba verdiği puan")
+print("   - rewards/margins (Artmalı): İyi ile kötü arasındaki fark")
+print("-" * 50)
+
+trainer = DPOTrainer(
+    model=model,
+    ref_model=None, # None = Mevcut modeli kopyalayıp dondurur (Otomatik referans)
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=eval_dataset,
+    processing_class=tokenizer, 
+    peft_config=peft_config,
+)
+
+trainer.train()
+
+# ==========================================
+# 7. KAYDETME
+# ==========================================
+print(f"\n💾 Model kaydediliyor: {NEW_MODEL_NAME}")
+trainer.model.save_pretrained(NEW_MODEL_NAME)
+tokenizer.save_pretrained(NEW_MODEL_NAME)
+
+print("🎉 Tebrikler! DPO Eğitimi Tamamlandı.")
+
+# ==========================================
+# 8. HIZLI TEST
+# ==========================================
+def test_model(prompt_text):
+    # Prompt formatını veri setindeki gibi yapıyoruz
+    # Ancak dataset içindeki prompt zaten formatlı olduğu için burada sadece
+    # temiz halini alıp tekrar formatlayacağız veya direkt vereceğiz.
+    # Güvenlik için manuel formatlayalım:
+    full_prompt = f"### Soru: {prompt_text}\n### Cevap:"
+    
+    inputs = tokenizer(full_prompt, return_tensors="pt").to(model.device)
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs, 
+            max_new_tokens=100, 
+            do_sample=True, 
+            temperature=0.7
+        )
+    return tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+# Test verisinden rastgele bir örnek alıp deneyelim
+print("\n🧪 Test Yapılıyor...")
+try:
+    # Prompt sütunundan ham soruyu çekip alalım (Formatı temizleyerek)
+    # NOT: Artık prompt içinde ### Soru var, o yüzden replace ile temizleyip test ediyoruz
+    raw_prompt = eval_dataset[0]['prompt'].replace("### Soru: ", "").replace("\n### Cevap:", "").strip()
+    
+    print(f"Soru: {raw_prompt}")
+    print("-" * 20)
+    print(f"Modelin Cevabı:\n{test_model(raw_prompt)}")
+except Exception as e:
+    print(f"Test sırasında hata oluştu: {e}")
