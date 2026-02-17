@@ -1,0 +1,23 @@
+# 1. Repoyu indir
+!git clone https://github.com/malhajar17/lm-evaluation-harness_turkish.git
+
+# 2. Klasöre gir
+%cd lm-evaluation-harness_turkish
+
+# 3. Gerekli kütüphaneleri kur
+!pip install -e .
+
+import os
+
+%cd /kaggle/working/lm-evaluation-harness_turkish
+
+# --- GÜNCELLENMİŞ KOD ---
+!python -m lm_eval \
+    --model hf \
+    --model_args pretrained=/kaggle/working/final_turkish_math_model,dtype=float16 \
+    --tasks gsm8k_tr \
+    --device cuda:0 \
+    --batch_size 4 \
+    --limit 100 \
+    --log_samples \
+    --output_path /kaggle/working/sft_lora_results.json
